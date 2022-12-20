@@ -2,10 +2,11 @@ import argparse
 import json
 import unicodedata
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 import torch
 import whisper
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from whisper import Whisper
 from whisper.audio import N_FRAMES, log_mel_spectrogram, pad_or_trim
@@ -101,6 +102,41 @@ def write_json(records: List[Record], output: str):
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 
+class AudioDataset(Dataset):
+    def __init__(self, records: List[Record], tokenizer: Tokenizer, fp16: bool = True) -> None:
+        self.records = records
+        self.tokenizer = tokenizer
+        self.fp16 = fp16
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        record = self.records[index]
+        mel = log_mel_spectrogram(record.audio_path)
+        mel = pad_or_trim(mel, N_FRAMES)
+        if self.fp16:
+            mel = mel.half()
+
+        tokens = self.tokenizer.encode(record.text)
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        return mel, tokens
+
+
+def get_dataloader(
+    json: str, tokenizer: Tokenizer, batch_size: int = 1, fp16: bool = True
+) -> DataLoader:
+    records = read_json(json)
+    dataset = AudioDataset(records, tokenizer, fp16)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+
 def get_tokens(tokenizer: Tokenizer, characters: str) -> torch.Tensor:
     tokens = []
     for char in characters:
@@ -119,7 +155,7 @@ def get_initial_tokens(tokenizer: Tokenizer, model: Whisper, initial_prompt: str
         initial_tokens.extend(initial_prompt[-(model.dims.n_text_ctx // 2 - 1) :])
 
     initial_tokens.extend(tokenizer.sot_sequence_including_notimestamps)
-    return torch.tensor(initial_tokens)
+    return torch.tensor(initial_tokens).unsqueeze(0).to(model.device)
 
 
 def cleanup_hooks(hooks: List[torch.utils.hooks.RemovableHandle]) -> None:
@@ -127,16 +163,10 @@ def cleanup_hooks(hooks: List[torch.utils.hooks.RemovableHandle]) -> None:
         hook.remove()
 
 
-def calculate_audio_features(audio_path: str, model: Whisper) -> torch.Tensor:
-    mel = log_mel_spectrogram(audio_path)
-    segment = pad_or_trim(mel, N_FRAMES).to(model.device)
-    return model.embed_audio(segment.unsqueeze(0))
-
-
 @torch.no_grad()
 def predict_punctuations(
-    audio_path: str,
-    text: str,
+    mel: torch.Tensor,
+    original_text_tokens: torch.Tensor,
     model: Whisper,
     tokenizer: Tokenizer,
     initial_tokens: torch.Tensor,
@@ -144,18 +174,16 @@ def predict_punctuations(
     punctuation_suppressing_tokens: torch.Tensor,
     min_probability: float,
 ) -> str:
-    audio_features = calculate_audio_features(audio_path, model)
+    audio_features = model.embed_audio(mel)
     kv_cache, hooks = model.install_kv_cache_hooks()
-    input_tokens = initial_tokens.unsqueeze(0).to(model.device)
-    original_text_tokens = torch.tensor(tokenizer.encode(text)).to(model.device)
-    len_original_text = len(original_text_tokens)
+    input_tokens = initial_tokens
     punctuated_tokens = []
 
-    for i in range(len_original_text):
+    for i in range(len(original_text_tokens)):
         token = original_text_tokens[i]
         punctuated_tokens.append(token.item())
         if (
-            i < len_original_text - 1
+            i < len(original_text_tokens) - 1
             and original_text_tokens[i + 1] in punctuation_suppressing_tokens
         ):
             continue
@@ -202,12 +230,15 @@ def main():
 
     model = whisper.load_model(args.model, args.device)
     initial_tokens = get_initial_tokens(tokenizer, model, args.initial_prompt)
+    # We currently only support batch size 1
+    data_loader = get_dataloader(args.json, tokenizer, batch_size=1, fp16=args.model == "cuda")
 
     punctuated_records = []
-    for record in tqdm(records):
+    for record, (mel, tokens) in tqdm(zip(records, data_loader), total=len(records)):
+        mel, tokens = mel.to(args.device), tokens[0].to(args.device)
         punctuated_text = predict_punctuations(
-            audio_path=record.audio_path,
-            text=record.text,
+            mel=mel,
+            original_text_tokens=tokens,
             model=model,
             tokenizer=tokenizer,
             initial_tokens=initial_tokens,
