@@ -2,7 +2,7 @@ import argparse
 import json
 import unicodedata
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import whisper
@@ -30,11 +30,16 @@ def get_parser() -> argparse.ArgumentParser:
         choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]),
         help="Language of the text",
     )
+    parser.add_argument("--beam-size", type=int, default=1, help="Beam size for beam search")
     parser.add_argument(
         "--min-probability",
         type=float,
-        default=0.2,
-        help="Minimum probability to insert a punctuation",
+        default=0.0,
+        help=(
+            "Minimum probability for a punctuation to be a candidate."
+            "Setting this to a higher value will speed up the process, but may result in less"
+            "punctuation being inserted."
+        ),
     )
     parser.add_argument(
         "--initial-prompt", type=str, default=None, help="Optional text to provide as a prompt"
@@ -42,11 +47,11 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--punctuation-suppressing-chars",
         type=str,
-        default="ー",
+        default=None,
         help=(
             "Do not insert punctuations `before` these characters."
-            "Default: ー (Japanese long vowel). This is useful to prevent typical Japanese"
-            "punctuation insertion errors such as まーはい -> ま、ーはい。"
+            "For example, if you set this to `ー` (Japanese long vowel), then `ー` will not be "
+            "preceded by a punctuation."
         ),
     )
     parser.add_argument("--unicode-normalize", action="store_true", help="Normalize unicode")
@@ -62,6 +67,15 @@ def get_parser() -> argparse.ArgumentParser:
         "--output", type=str, default="output/prediction.json", help="Path to the output file"
     )
     return parser
+
+
+@dataclass
+class DecodeOptions:
+    initial_tokens: torch.Tensor
+    punctuation_tokens: torch.Tensor
+    punctuation_suppressing_tokens: torch.Tensor
+    min_probability: float
+    beam_size: int
 
 
 @dataclass
@@ -119,7 +133,7 @@ class AudioDataset(Dataset):
             mel = mel.half()
 
         tokens = self.tokenizer.encode(record.text)
-        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = torch.tensor(tokens + [self.tokenizer.eot], dtype=torch.long)
         return mel, tokens
 
 
@@ -137,7 +151,10 @@ def get_dataloader(
     )
 
 
-def get_tokens(tokenizer: Tokenizer, characters: str) -> torch.Tensor:
+def get_tokens(tokenizer: Tokenizer, characters: Optional[str]) -> torch.Tensor:
+    if characters is None:
+        return torch.tensor([])
+
     tokens = []
     for char in characters:
         encoded = tokenizer.encode(char)
@@ -155,12 +172,19 @@ def get_initial_tokens(tokenizer: Tokenizer, model: Whisper, initial_prompt: str
         initial_tokens.extend(initial_prompt[-(model.dims.n_text_ctx // 2 - 1) :])
 
     initial_tokens.extend(tokenizer.sot_sequence_including_notimestamps)
-    return torch.tensor(initial_tokens).unsqueeze(0).to(model.device)
+    return torch.tensor(initial_tokens).to(model.device)
 
 
 def cleanup_hooks(hooks: List[torch.utils.hooks.RemovableHandle]) -> None:
     for hook in hooks:
         hook.remove()
+
+
+@dataclass
+class BeamNode:
+    tokens: torch.Tensor
+    sum_log_probs: float
+    length: int
 
 
 @torch.no_grad()
@@ -169,42 +193,58 @@ def predict_punctuations(
     original_text_tokens: torch.Tensor,
     model: Whisper,
     tokenizer: Tokenizer,
-    initial_tokens: torch.Tensor,
-    punctuation_tokens: torch.Tensor,
-    punctuation_suppressing_tokens: torch.Tensor,
-    min_probability: float,
+    decode_options: DecodeOptions,
 ) -> str:
     audio_features = model.embed_audio(mel)
-    kv_cache, hooks = model.install_kv_cache_hooks()
-    input_tokens = initial_tokens
-    punctuated_tokens = []
+    beams = [BeamNode(tokens=decode_options.initial_tokens.clone(), sum_log_probs=0.0, length=0)]
 
     for i in range(len(original_text_tokens)):
-        token = original_text_tokens[i]
-        punctuated_tokens.append(token.item())
-        if (
-            i < len(original_text_tokens) - 1
-            and original_text_tokens[i + 1] in punctuation_suppressing_tokens
-        ):
-            continue
-
-        input_tokens = torch.cat([input_tokens, token.view(1, 1)], dim=1)
-        logits = model.decoder(input_tokens, audio_features, kv_cache=kv_cache)
-        probabilities = logits.squeeze(0)[-1].softmax(dim=0)
-        max_punctuation_probability, max_punctuation_index = torch.max(
-            probabilities[punctuation_tokens], dim=0
+        next_token = original_text_tokens[i]
+        skip_punctuation_insertion = (
+            i == 0 or next_token in decode_options.punctuation_suppressing_tokens
         )
+        new_beams = []
 
-        if max_punctuation_probability > min_probability:
-            selected_punctuation = punctuation_tokens[max_punctuation_index]
-            punctuated_tokens.append(selected_punctuation.item())
-            # update kv_cache
-            model.decoder(selected_punctuation.view(1, 1), audio_features, kv_cache=kv_cache)
+        for beam in beams:
+            logits = model.decoder(beam.tokens.unsqueeze(0), audio_features)
+            next_probabilities = logits[0, -1, :].softmax(dim=0)
+            next_token_log_prob = torch.log(next_probabilities[next_token]).item()
+            no_punctuation_beam = BeamNode(
+                tokens=torch.cat([beam.tokens, next_token.unsqueeze(0)], dim=0),
+                sum_log_probs=beam.sum_log_probs + next_token_log_prob,
+                length=beam.length + 1,
+            )
+            new_beams.append(no_punctuation_beam)
 
-        input_tokens = torch.tensor([[]], dtype=torch.long).to(model.device)
+            if skip_punctuation_insertion:
+                continue
 
-    cleanup_hooks(hooks)
-    punctuated_text = tokenizer.decode(punctuated_tokens)
+            candidate_punctuation_tokens = decode_options.punctuation_tokens[
+                next_probabilities[decode_options.punctuation_tokens]
+                > decode_options.min_probability
+            ]
+            for punctuation_token in candidate_punctuation_tokens:
+                punctuation_log_prob = torch.log(next_probabilities[punctuation_token]).item()
+
+                input_tokens = torch.cat([beam.tokens, punctuation_token.unsqueeze(0)], dim=0)
+                logits = model.decoder(input_tokens.unsqueeze(0), audio_features)
+                log_probabilities = logits[0, -1, :].log_softmax(dim=0)
+                next_token_log_prob = log_probabilities[next_token].item()
+
+                new_beam = BeamNode(
+                    tokens=torch.cat([input_tokens, next_token.unsqueeze(0)], dim=0),
+                    sum_log_probs=beam.sum_log_probs + punctuation_log_prob + next_token_log_prob,
+                    length=beam.length + 2,
+                )
+                new_beams.append(new_beam)
+
+        beams = sorted(new_beams, key=lambda beam: beam.sum_log_probs / beam.length, reverse=True)
+        beams = beams[: decode_options.beam_size]
+
+    best_beam = beams[0]
+    punctuated_text = tokenizer.decode(
+        best_beam.tokens[decode_options.initial_tokens.shape[0] : -1].tolist()
+    )
     return punctuated_text
 
 
@@ -233,6 +273,14 @@ def main():
     # We currently only support batch size 1
     data_loader = get_dataloader(args.json, tokenizer, batch_size=1, fp16=args.model == "cuda")
 
+    decode_options = DecodeOptions(
+        initial_tokens=initial_tokens,
+        punctuation_tokens=punctuation_tokens,
+        punctuation_suppressing_tokens=punctuation_suppressing_tokens,
+        min_probability=args.min_probability,
+        beam_size=args.beam_size,
+    )
+
     punctuated_records = []
     for record, (mel, tokens) in tqdm(zip(records, data_loader), total=len(records)):
         mel, tokens = mel.to(args.device), tokens[0].to(args.device)
@@ -241,10 +289,7 @@ def main():
             original_text_tokens=tokens,
             model=model,
             tokenizer=tokenizer,
-            initial_tokens=initial_tokens,
-            punctuation_tokens=punctuation_tokens,
-            punctuation_suppressing_tokens=punctuation_suppressing_tokens,
-            min_probability=args.min_probability,
+            decode_options=decode_options,
         )
         punctuated_records.append(Record(record.audio_path, punctuated_text))
 
