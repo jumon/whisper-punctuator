@@ -1,5 +1,6 @@
 import argparse
 import json
+import string
 import unicodedata
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -32,13 +33,23 @@ def get_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--beam-size", type=int, default=1, help="Beam size for beam search")
     parser.add_argument(
-        "--min-probability",
+        "--min-punctuation-probability",
         type=float,
         default=0.0,
         help=(
             "Minimum probability for a punctuation to be a candidate."
-            "Setting this to a higher value will speed up the process, but may result in less"
-            "punctuation being inserted."
+            "Increasing this value will speed up the process, but may result in less punctuation "
+            "being inserted."
+        ),
+    )
+    parser.add_argument(
+        "--min-token-probability",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum probability for a token with the same spelling, when lowercased, to be a "
+            "candidate. Increasing this value will speed up the process, but may cause incorrect "
+            "capitalization."
         ),
     )
     parser.add_argument(
@@ -66,6 +77,14 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output", type=str, default="output/prediction.json", help="Path to the output file"
     )
+    parser.add_argument(
+        "--truecasing",
+        action="store_true",
+        help=(
+            "[Experimental] Truecase the output text. The current implementation is very slow and "
+            "does not work well in practice. We will improve the implementation in the future."
+        ),
+    )
     return parser
 
 
@@ -74,8 +93,10 @@ class DecodeOptions:
     initial_tokens: torch.Tensor
     punctuation_tokens: torch.Tensor
     punctuation_suppressing_tokens: torch.Tensor
-    min_probability: float
-    beam_size: int
+    min_punctuation_probability: float = 0.0
+    min_token_probability: float = 0.0
+    beam_size: int = 1
+    truecasing: bool = False  # Experimental
 
 
 @dataclass
@@ -172,7 +193,7 @@ def get_initial_tokens(tokenizer: Tokenizer, model: Whisper, initial_prompt: str
         initial_tokens.extend(initial_prompt[-(model.dims.n_text_ctx // 2 - 1) :])
 
     initial_tokens.extend(tokenizer.sot_sequence_including_notimestamps)
-    return torch.tensor(initial_tokens).to(model.device)
+    return torch.tensor(initial_tokens, device=model.device)
 
 
 def cleanup_hooks(hooks: List[torch.utils.hooks.RemovableHandle]) -> None:
@@ -185,6 +206,42 @@ class BeamNode:
     tokens: torch.Tensor
     sum_log_probs: float
     length: int
+
+
+def beam_score(node: BeamNode) -> float:
+    return node.sum_log_probs / node.length
+
+
+def includes_lowercase_alphabet(text: str) -> bool:
+    return any(c in string.ascii_lowercase for c in text)
+
+
+def get_same_spelling_tokens(
+    token_id: int,
+    probabilities: torch.Tensor,
+    tokenizer: Tokenizer,
+    min_probability: float,
+    max_num_tokens: int,
+    device: str,
+) -> torch.Tensor:
+    target_spelling = tokenizer.decode([token_id]).lower()
+    if not includes_lowercase_alphabet(target_spelling):
+        return torch.tensor([token_id], device=device)
+
+    token_probability = probabilities[token_id]
+
+    sorted_probabilities, sorted_indices = torch.sort(probabilities, descending=True)
+    same_spelling_tokens = []
+    for probability, index in zip(sorted_probabilities, sorted_indices):
+        if probability < min_probability and probability < token_probability:
+            break
+
+        if tokenizer.decode(index).lower() == target_spelling:
+            same_spelling_tokens.append(index)
+            if len(same_spelling_tokens) >= max_num_tokens:
+                break
+
+    return torch.tensor(same_spelling_tokens, device=device)
 
 
 @torch.no_grad()
@@ -208,37 +265,66 @@ def predict_punctuations(
         for beam in beams:
             logits = model.decoder(beam.tokens.unsqueeze(0), audio_features)
             next_probabilities = logits[0, -1, :].softmax(dim=0)
-            next_token_log_prob = torch.log(next_probabilities[next_token]).item()
-            no_punctuation_beam = BeamNode(
-                tokens=torch.cat([beam.tokens, next_token.unsqueeze(0)], dim=0),
-                sum_log_probs=beam.sum_log_probs + next_token_log_prob,
-                length=beam.length + 1,
-            )
-            new_beams.append(no_punctuation_beam)
+
+            if decode_options.truecasing:
+                next_tokens = get_same_spelling_tokens(
+                    token_id=next_token.item(),
+                    probabilities=next_probabilities,
+                    tokenizer=tokenizer,
+                    min_probability=decode_options.min_token_probability,
+                    max_num_tokens=decode_options.beam_size,
+                    device=model.device,
+                )
+            else:
+                next_tokens = next_token.unsqueeze(0)
+
+            for next_token in next_tokens:
+                next_token_log_prob = torch.log(next_probabilities[next_token]).item()
+                no_punctuation_beam = BeamNode(
+                    tokens=torch.cat([beam.tokens, next_token.unsqueeze(0)], dim=0),
+                    sum_log_probs=beam.sum_log_probs + next_token_log_prob,
+                    length=beam.length + 1,
+                )
+                new_beams.append(no_punctuation_beam)
 
             if skip_punctuation_insertion:
                 continue
 
             candidate_punctuation_tokens = decode_options.punctuation_tokens[
                 next_probabilities[decode_options.punctuation_tokens]
-                > decode_options.min_probability
+                > decode_options.min_punctuation_probability
             ]
             for punctuation_token in candidate_punctuation_tokens:
                 punctuation_log_prob = torch.log(next_probabilities[punctuation_token]).item()
 
                 input_tokens = torch.cat([beam.tokens, punctuation_token.unsqueeze(0)], dim=0)
                 logits = model.decoder(input_tokens.unsqueeze(0), audio_features)
-                log_probabilities = logits[0, -1, :].log_softmax(dim=0)
-                next_token_log_prob = log_probabilities[next_token].item()
+                token_probabilities = logits[0, -1, :].softmax(dim=0)
 
-                new_beam = BeamNode(
-                    tokens=torch.cat([input_tokens, next_token.unsqueeze(0)], dim=0),
-                    sum_log_probs=beam.sum_log_probs + punctuation_log_prob + next_token_log_prob,
-                    length=beam.length + 2,
-                )
-                new_beams.append(new_beam)
+                if decode_options.truecasing:
+                    next_tokens = get_same_spelling_tokens(
+                        token_id=next_token.item(),
+                        probabilities=token_probabilities,
+                        tokenizer=tokenizer,
+                        min_probability=decode_options.min_token_probability,
+                        max_num_tokens=decode_options.beam_size,
+                        device=model.device,
+                    )
+                else:
+                    next_tokens = next_token.unsqueeze(0)
 
-        beams = sorted(new_beams, key=lambda beam: beam.sum_log_probs / beam.length, reverse=True)
+                for next_token in next_tokens:
+                    next_token_log_prob = torch.log(token_probabilities[next_token]).item()
+                    new_beam = BeamNode(
+                        tokens=torch.cat([input_tokens, next_token.unsqueeze(0)], dim=0),
+                        sum_log_probs=beam.sum_log_probs
+                        + punctuation_log_prob
+                        + next_token_log_prob,
+                        length=beam.length + 2,
+                    )
+                    new_beams.append(new_beam)
+
+        beams = sorted(new_beams, key=lambda beam: beam_score(beam), reverse=True)
         beams = beams[: decode_options.beam_size]
 
     best_beam = beams[0]
@@ -277,8 +363,10 @@ def main():
         initial_tokens=initial_tokens,
         punctuation_tokens=punctuation_tokens,
         punctuation_suppressing_tokens=punctuation_suppressing_tokens,
-        min_probability=args.min_probability,
+        min_punctuation_probability=args.min_punctuation_probability,
+        min_token_probability=args.min_token_probability,
         beam_size=args.beam_size,
+        truecasing=args.truecasing,
     )
 
     punctuated_records = []
