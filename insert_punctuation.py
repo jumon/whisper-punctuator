@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import string
 import unicodedata
 from dataclasses import dataclass
@@ -85,6 +86,34 @@ def get_parser() -> argparse.ArgumentParser:
             "does not work well in practice. We will improve the implementation in the future."
         ),
     )
+    parser.add_argument(
+        "--truecase-first-character",
+        action="store_true",
+        help="Always truecase the first character. Only used when --truecasing is set.",
+    )
+    parser.add_argument(
+        "--no-truecase-first-character", action="store_false", dest="truecase-first-character"
+    )
+    parser.set_defaults(truecase_first_character=True)
+    parser.add_argument(
+        "--truecase-after-period",
+        action="store_true",
+        help=(
+            "Always truecase the first character after a period. Only used when --truecasing is "
+            "set. `.`, `?`, `!`, and `。` are considered periods by default. To use other "
+            "characters as periods, use the --periods option."
+        ),
+    )
+    parser.add_argument(
+        "--no-truecase-after-period", action="store_false", dest="truecase-after-period"
+    )
+    parser.set_defaults(truecase_after_period=True)
+    parser.add_argument(
+        "--periods",
+        type=str,
+        default=".?!。",
+        help="Period characters for truecasing by the --truecase-after-period option",
+    )
     return parser
 
 
@@ -97,6 +126,9 @@ class DecodeOptions:
     min_token_probability: float = 0.0
     beam_size: int = 1
     truecasing: bool = False  # Experimental
+    truecase_first_character: bool = True
+    truecase_after_period: bool = True
+    periods: str = ".?!。"
 
 
 @dataclass
@@ -249,6 +281,21 @@ def get_same_spelling_tokens(
     return torch.tensor(same_spelling_tokens, device=device)
 
 
+def post_truecasing(
+    text: str,
+    truecase_first_character: bool = True,
+    truecase_after_period: bool = True,
+    periods: str = ".?!。",
+) -> str:
+    if truecase_first_character:
+        text = text[0].upper() + text[1:]
+
+    if truecase_after_period:
+        text = re.sub(f"([{periods}] )([a-z])", lambda m: m.group(1) + m.group(2).upper(), text)
+
+    return text
+
+
 @torch.no_grad()
 def predict_punctuations(
     mel: torch.Tensor,
@@ -336,16 +383,21 @@ def predict_punctuations(
     punctuated_text = tokenizer.decode(
         best_beam.tokens[decode_options.initial_tokens.shape[0] : -1].tolist()
     ).strip()
+
+    if decode_options.truecasing:
+        punctuated_text = post_truecasing(
+            text=punctuated_text,
+            truecase_first_character=decode_options.truecase_first_character,
+            truecase_after_period=decode_options.truecase_after_period,
+            periods=decode_options.periods,
+        )
+
     return punctuated_text
 
 
-def main():
-    args = get_parser().parse_args()
-    records = create_records(args)
-
-    tokenizer = get_tokenizer(
-        multilingual=".en" not in args.model, language=args.language, task="transcribe"
-    )
+def construct_decode_options(
+    tokenizer: Tokenizer, model: Whisper, args: argparse.Namespace
+) -> DecodeOptions:
     try:
         punctuation_tokens = get_tokens(tokenizer, args.punctuations)
     except ValueError:
@@ -359,12 +411,9 @@ def main():
     punctuation_tokens = punctuation_tokens.to(args.device)
     punctuation_suppressing_tokens = punctuation_suppressing_tokens.to(args.device)
 
-    model = whisper.load_model(args.model, args.device)
     initial_tokens = get_initial_tokens(tokenizer, model, args.initial_prompt)
-    # We currently only support batch size 1
-    data_loader = get_dataloader(args.json, tokenizer, batch_size=1, fp16=args.model == "cuda")
 
-    decode_options = DecodeOptions(
+    return DecodeOptions(
         initial_tokens=initial_tokens,
         punctuation_tokens=punctuation_tokens,
         punctuation_suppressing_tokens=punctuation_suppressing_tokens,
@@ -372,7 +421,24 @@ def main():
         min_token_probability=args.min_token_probability,
         beam_size=args.beam_size,
         truecasing=args.truecasing,
+        truecase_first_character=args.truecase_first_character,
+        truecase_after_period=args.truecase_after_period,
+        periods=args.periods,
     )
+
+
+def main():
+    args = get_parser().parse_args()
+    records = create_records(args)
+
+    tokenizer = get_tokenizer(
+        multilingual=".en" not in args.model, language=args.language, task="transcribe"
+    )
+    model = whisper.load_model(args.model, args.device)
+    decode_options = construct_decode_options(tokenizer, model, args)
+
+    # We currently only support batch size 1
+    data_loader = get_dataloader(args.json, tokenizer, batch_size=1, fp16=args.model == "cuda")
 
     punctuated_records = []
     for record, (mel, tokens) in tqdm(zip(records, data_loader), total=len(records)):
