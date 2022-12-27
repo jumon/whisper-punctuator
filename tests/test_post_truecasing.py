@@ -1,10 +1,6 @@
-import sys
-
-sys.path.append("..")
-
 import pytest
 
-from insert_punctuation import post_truecasing
+from whisper_punctuator.punctuator import post_truecasing
 
 
 # Testcases are take from the TEDLIUM2 corpus (https://www.openslr.org/19/, CC BY-NC-ND 3.0)
