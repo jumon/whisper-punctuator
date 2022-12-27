@@ -153,8 +153,13 @@ class AudioDataset(Dataset):
         if self.fp16:
             mel = mel.half()
 
-        tokens = self.tokenizer.encode(record.text)
+        if self.tokenizer.language in ["ja", "zh"]:
+            text = record.text.strip()
+        else:
+            text = " " + record.text.strip()
+        tokens = self.tokenizer.encode(text)
         tokens = torch.tensor(tokens + [self.tokenizer.eot], dtype=torch.long)
+
         return mel, tokens
 
 
@@ -330,7 +335,7 @@ def predict_punctuations(
     best_beam = beams[0]
     punctuated_text = tokenizer.decode(
         best_beam.tokens[decode_options.initial_tokens.shape[0] : -1].tolist()
-    )
+    ).strip()
     return punctuated_text
 
 
