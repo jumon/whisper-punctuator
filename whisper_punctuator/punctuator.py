@@ -21,7 +21,7 @@ class DecodeOptions:
     min_punctuation_probability: float = 0.0
     min_token_probability: float = 0.0
     beam_size: int = 1
-    truecasing: bool = False
+    truecase_search: bool = False
     truecase_first_character: bool = True
     truecase_after_period: bool = True
     periods: str = ".?!。"
@@ -213,7 +213,7 @@ def predict_punctuations(
             logits = model.decoder(beam.tokens.unsqueeze(0), audio_features)
             next_probabilities = logits[0, -1, :].softmax(dim=0)
 
-            if decode_options.truecasing:
+            if decode_options.truecase_search:
                 next_tokens = get_same_spelling_tokens(
                     token_id=next_token.item(),
                     probabilities=next_probabilities,
@@ -248,7 +248,7 @@ def predict_punctuations(
                 logits = model.decoder(input_tokens.unsqueeze(0), audio_features)
                 token_probabilities = logits[0, -1, :].softmax(dim=0)
 
-                if decode_options.truecasing:
+                if decode_options.truecase_search:
                     next_tokens = get_same_spelling_tokens(
                         token_id=next_token.item(),
                         probabilities=token_probabilities,
@@ -279,13 +279,12 @@ def predict_punctuations(
         best_beam.tokens[decode_options.initial_tokens.shape[0] : -1].tolist()
     ).strip()
 
-    if decode_options.truecasing:
-        punctuated_text = post_truecasing(
-            text=punctuated_text,
-            truecase_first_character=decode_options.truecase_first_character,
-            truecase_after_period=decode_options.truecase_after_period,
-            periods=decode_options.periods,
-        )
+    punctuated_text = post_truecasing(
+        text=punctuated_text,
+        truecase_first_character=decode_options.truecase_first_character,
+        truecase_after_period=decode_options.truecase_after_period,
+        periods=decode_options.periods,
+    )
 
     return punctuated_text
 
@@ -315,7 +314,7 @@ def construct_decode_options(
         min_punctuation_probability=args.min_punctuation_probability,
         min_token_probability=args.min_token_probability,
         beam_size=args.beam_size,
-        truecasing=args.truecasing,
+        truecase_search=args.truecase_search,
         truecase_first_character=args.truecase_first_character,
         truecase_after_period=args.truecase_after_period,
         periods=args.periods,

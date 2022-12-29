@@ -83,17 +83,17 @@ def get_parser() -> argparse.ArgumentParser:
         "--output", type=str, default="output/prediction.json", help="Path to the output file"
     )
     parser.add_argument(
-        "--truecasing",
+        "--truecase-search",
         action="store_true",
         help=(
-            "Truecase the output text. The current implementation is very slow. We plan to improve "
-            "the implementation in the future."
+            "Search for the best truecasing. The current implementation is very slow, but we plan "
+            "to improve the implementation in the future."
         ),
     )
     parser.add_argument(
         "--truecase-first-character",
         action="store_true",
-        help="Always truecase the first character. Only used when --truecasing is set.",
+        help="Always truecase the first character.",
     )
     parser.add_argument(
         "--no-truecase-first-character", action="store_false", dest="truecase-first-character"
@@ -103,9 +103,9 @@ def get_parser() -> argparse.ArgumentParser:
         "--truecase-after-period",
         action="store_true",
         help=(
-            "Always truecase the first character after a period. Only used when --truecasing is "
-            "set. `.`, `?`, `!`, and `。` are considered periods by default. To use other "
-            "characters as periods, use the --periods option."
+            "Always truecase the first character after a period. `.`, `?`, `!`, and `。` are "
+            "considered periods by default. To use other characters as periods, use the --periods "
+            "option."
         ),
     )
     parser.add_argument(
