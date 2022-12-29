@@ -1,16 +1,12 @@
-import argparse
-import json
 import re
 import string
-import unicodedata
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional, Union
 
 import torch
-from torch.utils.data import DataLoader, Dataset
-from whisper import Whisper
+import whisper
 from whisper.audio import N_FRAMES, log_mel_spectrogram, pad_or_trim
-from whisper.tokenizer import Tokenizer
+from whisper.tokenizer import get_tokenizer
 
 
 @dataclass
@@ -27,295 +23,242 @@ class DecodeOptions:
     periods: str = ".?!。"
 
 
-@dataclass
-class Record:
-    audio_path: str
-    text: str
+class Punctuator:
+    def __init__(
+        self,
+        model_name: str = "small",
+        language: str = "en",
+        device: Optional[str] = None,
+        punctuations: str = ",.?",
+        punctuation_suppressing_chars: str = "",
+        initial_prompt: str = "",
+        min_punctuation_probability: float = 0.0,
+        min_token_probability: float = 0.0,
+        beam_size: int = 1,
+        truecase_search: bool = False,
+        truecase_first_character: bool = True,
+        truecase_after_period: bool = True,
+        periods: str = ".?!。",
+    ):
+        self.device = self._get_device(device)
+        self.fp16 = self.device == "cuda"
+        self.tokenizer = get_tokenizer(
+            multilingual=".en" not in model_name, language=language, task="transcribe"
+        )
+        self.model = whisper.load_model(model_name, device=self.device)
 
+        try:
+            punctuation_tokens = self._get_tokens(punctuations)
+        except ValueError:
+            raise ValueError("Each character in `punctuations` must be a single token")
 
-def create_records(args: argparse.Namespace) -> List[Record]:
-    if args.audio is not None and args.text is not None:
-        records = [Record(args.audio, args.text)]
-    elif args.json is not None:
-        records = read_json(args.json)
-    else:
-        raise ValueError("Either --audio and --text or --json must be specified")
+        try:
+            punctuation_suppressing_tokens = self._get_tokens(punctuation_suppressing_chars)
+        except ValueError:
+            raise ValueError(
+                "Each character in `punctuation_suppressing_chars` must be a single token"
+            )
 
-    if args.unicode_normalize:
-        records = [
-            Record(record.audio_path, unicodedata.normalize("NFKC", record.text))
-            for record in records
-        ]
-    return records
+        self.decode_options = DecodeOptions(
+            initial_tokens=self._get_initial_tokens(initial_prompt),
+            punctuation_tokens=punctuation_tokens,
+            punctuation_suppressing_tokens=punctuation_suppressing_tokens,
+            min_punctuation_probability=min_punctuation_probability,
+            min_token_probability=min_token_probability,
+            beam_size=beam_size,
+            truecase_search=truecase_search,
+            truecase_first_character=truecase_first_character,
+            truecase_after_period=truecase_after_period,
+            periods=periods,
+        )
 
+    def _get_device(self, device: Optional[str]) -> str:
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        return device
 
-def read_json(path: str) -> List[Record]:
-    records = []
-    with open(path) as f:
-        for line in f:
-            data = json.loads(line)
-            records.append(Record(audio_path=data["audio_path"], text=data["text"]))
-    return records
+    def _get_tokens(self, characters: Optional[str]) -> torch.Tensor:
+        tokens = []
+        for char in characters:
+            encoded = self.tokenizer.encode(char)
+            if len(encoded) > 1:
+                raise ValueError(f"Character {char} is not a single token")
+            tokens.append(encoded[0])
+        return torch.tensor(tokens, device=self.device)
 
+    def _get_initial_tokens(self, initial_prompt: str) -> torch.Tensor:
+        initial_tokens = []
+        if initial_prompt != "":
+            initial_tokens.append(self.tokenizer.sot_prev)
+            initial_prompt = self.tokenizer.encode(" " + initial_prompt.strip())
+            initial_tokens.extend(initial_prompt[-(self.model.dims.n_text_ctx // 2 - 1) :])
 
-def write_json(records: List[Record], output: str):
-    with open(output, "w") as f:
-        for record in records:
-            data = {"audio_path": record.audio_path, "text": record.text}
-            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        initial_tokens.extend(self.tokenizer.sot_sequence_including_notimestamps)
+        return torch.tensor(initial_tokens, device=self.device)
 
+    def _includes_lowercase_alphabet(self, text: str) -> bool:
+        return any(c in string.ascii_lowercase for c in text)
 
-class AudioDataset(Dataset):
-    def __init__(self, records: List[Record], tokenizer: Tokenizer, fp16: bool = True) -> None:
-        self.records = records
-        self.tokenizer = tokenizer
-        self.fp16 = fp16
+    def _get_same_spelling_tokens(
+        self, token_id: int, probabilities: torch.Tensor, max_num_tokens: int
+    ) -> torch.Tensor:
+        target_spelling = self.tokenizer.decode([token_id]).lower()
+        if not self._includes_lowercase_alphabet(target_spelling):
+            return torch.tensor([token_id], device=self.device)
 
-    def __len__(self) -> int:
-        return len(self.records)
+        token_probability = probabilities[token_id]
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        record = self.records[index]
-        mel = log_mel_spectrogram(record.audio_path)
+        sorted_probabilities, sorted_indices = torch.sort(probabilities, descending=True)
+        same_spelling_tokens = []
+        for probability, index in zip(sorted_probabilities, sorted_indices):
+            if (
+                probability < self.decode_options.min_token_probability
+                and probability < token_probability
+            ):
+                break
+
+            if self.tokenizer.decode(index).lower() == target_spelling:
+                same_spelling_tokens.append(index)
+                if len(same_spelling_tokens) >= max_num_tokens:
+                    break
+
+        return torch.tensor(same_spelling_tokens, device=self.device)
+
+    def post_truecasing(self, text: str) -> str:
+        if self.decode_options.truecase_first_character:
+            text = text[0].upper() + text[1:]
+
+        if self.decode_options.truecase_after_period:
+            text = re.sub(
+                f"([{self.decode_options.periods}] )([a-z])",
+                lambda m: m.group(1) + m.group(2).upper(),
+                text,
+            )
+
+        return text
+
+    def _load_mel(self, audio_path: str) -> torch.Tensor:
+        mel = log_mel_spectrogram(audio_path)
         mel = pad_or_trim(mel, N_FRAMES)
         if self.fp16:
             mel = mel.half()
+        return mel
 
+    def _encode_text(self, text: str) -> torch.Tensor:
         if self.tokenizer.language in ["ja", "zh"]:
-            text = record.text.strip()
+            text = text.strip()
         else:
-            text = " " + record.text.strip()
+            text = " " + text.strip()
         tokens = self.tokenizer.encode(text)
         tokens = torch.tensor(tokens + [self.tokenizer.eot], dtype=torch.long)
+        return tokens
 
-        return mel, tokens
+    def _get_candidate_punctuations(self, probabilities: torch.Tensor) -> torch.Tensor:
+        return self.decode_options.punctuation_tokens[
+            probabilities[self.decode_options.punctuation_tokens]
+            > self.decode_options.min_punctuation_probability
+        ]
 
+    def _should_skip_punctuation_insertion(self, i: int, next_token: torch.Tensor) -> bool:
+        return i == 0 or next_token in self.decode_options.punctuation_suppressing_tokens
 
-def get_dataloader(
-    records: List[Record], tokenizer: Tokenizer, batch_size: int = 1, fp16: bool = True
-) -> DataLoader:
-    dataset = AudioDataset(records, tokenizer, fp16)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True,
-    )
+    def _get_next_tokens(
+        self, next_token: torch.Tensor, probabilities: torch.Tensor
+    ) -> torch.Tensor:
+        if self.decode_options.truecase_search:
+            return self._get_same_spelling_tokens(
+                token_id=next_token.item(),
+                probabilities=probabilities,
+                max_num_tokens=self.decode_options.beam_size,
+            )
+        else:
+            return next_token.unsqueeze(0)
 
+    @torch.no_grad()
+    def punctuate(self, audio: Union[str, torch.Tensor], text: Union[str, torch.Tensor]) -> str:
+        if isinstance(audio, str):
+            audio = self._load_mel(audio)
 
-def get_tokens(tokenizer: Tokenizer, characters: Optional[str]) -> torch.Tensor:
-    if characters is None:
-        return torch.tensor([])
+        if isinstance(text, str):
+            original_text_tokens = self._encode_text(text)
+        else:
+            original_text_tokens = text
 
-    tokens = []
-    for char in characters:
-        encoded = tokenizer.encode(char)
-        if len(encoded) > 1:
-            raise ValueError(f"Character {char} is not a single token")
-        tokens.append(encoded[0])
-    return torch.tensor(tokens)
+        audio_features = self.model.embed_audio(audio)
+        beams = [BeamNode(tokens=self.decode_options.initial_tokens, sum_log_probs=0.0, length=0)]
 
+        for i in range(len(original_text_tokens)):
+            next_token = original_text_tokens[i]
+            skip_punctuation_insertion = self._should_skip_punctuation_insertion(i, next_token)
+            new_beams = []
 
-def get_initial_tokens(tokenizer: Tokenizer, model: Whisper, initial_prompt: str) -> torch.Tensor:
-    initial_tokens = []
-    if initial_prompt is not None:
-        initial_tokens.append(tokenizer.sot_prev)
-        initial_prompt = tokenizer.encode(" " + initial_prompt.strip())
-        initial_tokens.extend(initial_prompt[-(model.dims.n_text_ctx // 2 - 1) :])
-
-    initial_tokens.extend(tokenizer.sot_sequence_including_notimestamps)
-    return torch.tensor(initial_tokens, device=model.device)
-
-
-def cleanup_hooks(hooks: List[torch.utils.hooks.RemovableHandle]) -> None:
-    for hook in hooks:
-        hook.remove()
-
-
-@dataclass
-class BeamNode:
-    tokens: torch.Tensor
-    sum_log_probs: float
-    length: int
-
-
-def beam_score(node: BeamNode) -> float:
-    return node.sum_log_probs / node.length
-
-
-def includes_lowercase_alphabet(text: str) -> bool:
-    return any(c in string.ascii_lowercase for c in text)
-
-
-def get_same_spelling_tokens(
-    token_id: int,
-    probabilities: torch.Tensor,
-    tokenizer: Tokenizer,
-    min_probability: float,
-    max_num_tokens: int,
-    device: str,
-) -> torch.Tensor:
-    target_spelling = tokenizer.decode([token_id]).lower()
-    if not includes_lowercase_alphabet(target_spelling):
-        return torch.tensor([token_id], device=device)
-
-    token_probability = probabilities[token_id]
-
-    sorted_probabilities, sorted_indices = torch.sort(probabilities, descending=True)
-    same_spelling_tokens = []
-    for probability, index in zip(sorted_probabilities, sorted_indices):
-        if probability < min_probability and probability < token_probability:
-            break
-
-        if tokenizer.decode(index).lower() == target_spelling:
-            same_spelling_tokens.append(index)
-            if len(same_spelling_tokens) >= max_num_tokens:
-                break
-
-    return torch.tensor(same_spelling_tokens, device=device)
-
-
-def post_truecasing(
-    text: str,
-    truecase_first_character: bool = True,
-    truecase_after_period: bool = True,
-    periods: str = ".?!。",
-) -> str:
-    if truecase_first_character:
-        text = text[0].upper() + text[1:]
-
-    if truecase_after_period:
-        text = re.sub(f"([{periods}] )([a-z])", lambda m: m.group(1) + m.group(2).upper(), text)
-
-    return text
-
-
-@torch.no_grad()
-def predict_punctuations(
-    mel: torch.Tensor,
-    original_text_tokens: torch.Tensor,
-    model: Whisper,
-    tokenizer: Tokenizer,
-    decode_options: DecodeOptions,
-) -> str:
-    audio_features = model.embed_audio(mel)
-    beams = [BeamNode(tokens=decode_options.initial_tokens.clone(), sum_log_probs=0.0, length=0)]
-
-    for i in range(len(original_text_tokens)):
-        next_token = original_text_tokens[i]
-        skip_punctuation_insertion = (
-            i == 0 or next_token in decode_options.punctuation_suppressing_tokens
-        )
-        new_beams = []
-
-        for beam in beams:
-            logits = model.decoder(beam.tokens.unsqueeze(0), audio_features)
-            next_probabilities = logits[0, -1, :].softmax(dim=0)
-
-            if decode_options.truecase_search:
-                next_tokens = get_same_spelling_tokens(
-                    token_id=next_token.item(),
-                    probabilities=next_probabilities,
-                    tokenizer=tokenizer,
-                    min_probability=decode_options.min_token_probability,
-                    max_num_tokens=decode_options.beam_size,
-                    device=model.device,
-                )
-            else:
-                next_tokens = next_token.unsqueeze(0)
-
-            for next_token in next_tokens:
-                next_token_log_prob = torch.log(next_probabilities[next_token]).item()
-                no_punctuation_beam = BeamNode(
-                    tokens=torch.cat([beam.tokens, next_token.unsqueeze(0)], dim=0),
-                    sum_log_probs=beam.sum_log_probs + next_token_log_prob,
-                    length=beam.length + 1,
-                )
-                new_beams.append(no_punctuation_beam)
-
-            if skip_punctuation_insertion:
-                continue
-
-            candidate_punctuation_tokens = decode_options.punctuation_tokens[
-                next_probabilities[decode_options.punctuation_tokens]
-                > decode_options.min_punctuation_probability
-            ]
-            for punctuation_token in candidate_punctuation_tokens:
-                punctuation_log_prob = torch.log(next_probabilities[punctuation_token]).item()
-
-                input_tokens = torch.cat([beam.tokens, punctuation_token.unsqueeze(0)], dim=0)
-                logits = model.decoder(input_tokens.unsqueeze(0), audio_features)
-                token_probabilities = logits[0, -1, :].softmax(dim=0)
-
-                if decode_options.truecase_search:
-                    next_tokens = get_same_spelling_tokens(
-                        token_id=next_token.item(),
-                        probabilities=token_probabilities,
-                        tokenizer=tokenizer,
-                        min_probability=decode_options.min_token_probability,
-                        max_num_tokens=decode_options.beam_size,
-                        device=model.device,
-                    )
-                else:
-                    next_tokens = next_token.unsqueeze(0)
+            for beam in beams:
+                logits = self.model.decoder(beam.tokens.unsqueeze(0), audio_features)
+                next_probabilities = logits[0, -1, :].softmax(dim=0)
+                next_tokens = self._get_next_tokens(next_token, next_probabilities)
 
                 for next_token in next_tokens:
-                    next_token_log_prob = torch.log(token_probabilities[next_token]).item()
-                    new_beam = BeamNode(
-                        tokens=torch.cat([input_tokens, next_token.unsqueeze(0)], dim=0),
-                        sum_log_probs=beam.sum_log_probs
-                        + punctuation_log_prob
-                        + next_token_log_prob,
-                        length=beam.length + 2,
+                    next_token_log_prob = torch.log(next_probabilities[next_token]).item()
+                    no_punctuation_beam = BeamNode(
+                        tokens=torch.cat([beam.tokens, next_token.unsqueeze(0)], dim=0),
+                        sum_log_probs=beam.sum_log_probs + next_token_log_prob,
+                        length=beam.length + 1,
                     )
-                    new_beams.append(new_beam)
+                    new_beams.append(no_punctuation_beam)
 
-        beams = sorted(new_beams, key=lambda beam: beam_score(beam), reverse=True)
-        beams = beams[: decode_options.beam_size]
+                if skip_punctuation_insertion:
+                    continue
 
-    best_beam = beams[0]
-    punctuated_text = tokenizer.decode(
-        best_beam.tokens[decode_options.initial_tokens.shape[0] : -1].tolist()
-    ).strip()
+                candidate_punctuations = self._get_candidate_punctuations(next_probabilities)
+                for punctuation_token in candidate_punctuations:
+                    punctuation_log_prob = torch.log(next_probabilities[punctuation_token]).item()
 
-    punctuated_text = post_truecasing(
-        text=punctuated_text,
-        truecase_first_character=decode_options.truecase_first_character,
-        truecase_after_period=decode_options.truecase_after_period,
-        periods=decode_options.periods,
-    )
+                    input_tokens = torch.cat([beam.tokens, punctuation_token.unsqueeze(0)], dim=0)
+                    logits = self.model.decoder(input_tokens.unsqueeze(0), audio_features)
+                    token_probabilities = logits[0, -1, :].softmax(dim=0)
+                    next_tokens = self._get_next_tokens(next_token, token_probabilities)
 
-    return punctuated_text
+                    for next_token in next_tokens:
+                        next_token_log_prob = torch.log(token_probabilities[next_token]).item()
+                        new_beam = BeamNode(
+                            tokens=torch.cat([input_tokens, next_token.unsqueeze(0)], dim=0),
+                            sum_log_probs=beam.sum_log_probs
+                            + punctuation_log_prob
+                            + next_token_log_prob,
+                            length=beam.length + 2,
+                        )
+                        new_beams.append(new_beam)
+
+            beams = sorted(new_beams, reverse=True)[: self.decode_options.beam_size]
+
+        best_beam = beams[0]
+        punctuated_tokens = best_beam.tokens[self.decode_options.initial_tokens.shape[0] : -1]
+        punctuated_text = self.tokenizer.decode(punctuated_tokens.tolist()).strip()
+        punctuated_text = self.post_truecasing(punctuated_text)
+
+        return punctuated_text
 
 
-def construct_decode_options(
-    tokenizer: Tokenizer, model: Whisper, args: argparse.Namespace
-) -> DecodeOptions:
-    try:
-        punctuation_tokens = get_tokens(tokenizer, args.punctuations)
-    except ValueError:
-        raise ValueError("Punctuations must be single tokens")
+class BeamNode:
+    def __init__(self, tokens: torch.Tensor, sum_log_probs: float, length: int) -> None:
+        self.tokens = tokens
+        self.sum_log_probs = sum_log_probs
+        self.length = length
 
-    try:
-        punctuation_suppressing_tokens = get_tokens(tokenizer, args.punctuation_suppressing_chars)
-    except ValueError:
-        raise ValueError("punctuation-suppressing-chars must be single tokens")
+    def beam_score(self) -> float:
+        return self.sum_log_probs / self.length
 
-    punctuation_tokens = punctuation_tokens.to(args.device)
-    punctuation_suppressing_tokens = punctuation_suppressing_tokens.to(args.device)
+    def __lt__(self, other: "BeamNode") -> bool:
+        return self.beam_score() < other.beam_score()
 
-    initial_tokens = get_initial_tokens(tokenizer, model, args.initial_prompt)
+    def __gt__(self, other: "BeamNode") -> bool:
+        return self.beam_score() > other.beam_score()
 
-    return DecodeOptions(
-        initial_tokens=initial_tokens,
-        punctuation_tokens=punctuation_tokens,
-        punctuation_suppressing_tokens=punctuation_suppressing_tokens,
-        min_punctuation_probability=args.min_punctuation_probability,
-        min_token_probability=args.min_token_probability,
-        beam_size=args.beam_size,
-        truecase_search=args.truecase_search,
-        truecase_first_character=args.truecase_first_character,
-        truecase_after_period=args.truecase_after_period,
-        periods=args.periods,
-    )
+    def __eq__(self, other: "BeamNode") -> bool:
+        return self.beam_score() == other.beam_score()
+
+    def __le__(self, other: "BeamNode") -> bool:
+        return self.beam_score() <= other.beam_score()
+
+    def __ge__(self, other: "BeamNode") -> bool:
+        return self.beam_score() >= other.beam_score()

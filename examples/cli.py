@@ -1,18 +1,17 @@
 import argparse
+import json
+import unicodedata
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import torch
 import whisper
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE, get_tokenizer
+from whisper.audio import N_FRAMES, log_mel_spectrogram, pad_or_trim
+from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE, Tokenizer
 
-from whisper_punctuator.punctuator import (
-    Record,
-    construct_decode_options,
-    create_records,
-    get_dataloader,
-    predict_punctuations,
-    write_json,
-)
+from whisper_punctuator import Punctuator
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -54,12 +53,12 @@ def get_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--initial-prompt", type=str, default=None, help="Optional text to provide as a prompt"
+        "--initial-prompt", type=str, default="", help="Optional text to provide as a prompt"
     )
     parser.add_argument(
         "--punctuation-suppressing-chars",
         type=str,
-        default=None,
+        default="",
         help=(
             "Do not insert punctuations `before` these characters."
             "For example, if you set this to `ー` (Japanese long vowel), then `ー` will not be "
@@ -121,29 +120,115 @@ def get_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@dataclass
+class Record:
+    audio_path: str
+    text: str
+
+
+class AudioDataset(Dataset):
+    def __init__(self, records: List[Record], tokenizer: Tokenizer, fp16: bool = True) -> None:
+        self.records = records
+        self.tokenizer = tokenizer
+        self.fp16 = fp16
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        record = self.records[index]
+        mel = log_mel_spectrogram(record.audio_path)
+        mel = pad_or_trim(mel, N_FRAMES)
+        if self.fp16:
+            mel = mel.half()
+
+        if self.tokenizer.language in ["ja", "zh"]:
+            text = record.text.strip()
+        else:
+            text = " " + record.text.strip()
+        tokens = self.tokenizer.encode(text)
+        tokens = torch.tensor(tokens + [self.tokenizer.eot], dtype=torch.long)
+
+        return mel, tokens
+
+
+def get_dataloader(
+    records: List[Record], tokenizer: Tokenizer, batch_size: int = 1, fp16: bool = True
+) -> DataLoader:
+    dataset = AudioDataset(records, tokenizer, fp16)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+
+def create_records(
+    audio: Optional[str], text: Optional[str], json: Optional[str], unicode_normalize: bool = False
+) -> List[Record]:
+    if audio is not None and text is not None:
+        records = [Record(audio, text)]
+    elif json is not None:
+        records = read_json(json)
+    else:
+        raise ValueError("Either --audio and --text or --json must be specified")
+
+    if unicode_normalize:
+        records = [
+            Record(record.audio_path, unicodedata.normalize("NFKC", record.text))
+            for record in records
+        ]
+    return records
+
+
+def read_json(path: str) -> List[Record]:
+    records = []
+    with open(path) as f:
+        for line in f:
+            data = json.loads(line)
+            records.append(Record(audio_path=data["audio_path"], text=data["text"]))
+    return records
+
+
+def write_json(records: List[Record], output: str):
+    with open(output, "w") as f:
+        for record in records:
+            data = {"audio_path": record.audio_path, "text": record.text}
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
 def main():
     args = get_parser().parse_args()
-    records = create_records(args)
 
-    tokenizer = get_tokenizer(
-        multilingual=".en" not in args.model, language=args.language, task="transcribe"
+    records = create_records(args.audio, args.text, args.json, args.unicode_normalize)
+
+    punctuator = Punctuator(
+        model_name=args.model,
+        language=args.language,
+        device=args.device,
+        punctuations=args.punctuations,
+        punctuation_suppressing_chars=args.punctuation_suppressing_chars,
+        initial_prompt=args.initial_prompt,
+        min_punctuation_probability=args.min_punctuation_probability,
+        min_token_probability=args.min_token_probability,
+        beam_size=args.beam_size,
+        truecase_search=args.truecase_search,
+        truecase_first_character=args.truecase_first_character,
+        truecase_after_period=args.truecase_after_period,
+        periods=args.periods,
     )
-    model = whisper.load_model(args.model, args.device)
-    decode_options = construct_decode_options(tokenizer, model, args)
 
     # We currently only support batch size 1
-    data_loader = get_dataloader(records, tokenizer, batch_size=1, fp16=args.device == "cuda")
+    data_loader = get_dataloader(
+        records, punctuator.tokenizer, batch_size=1, fp16=args.device == "cuda"
+    )
 
     punctuated_records = []
     for record, (mel, tokens) in tqdm(zip(records, data_loader), total=len(records)):
         mel, tokens = mel.to(args.device), tokens[0].to(args.device)
-        punctuated_text = predict_punctuations(
-            mel=mel,
-            original_text_tokens=tokens,
-            model=model,
-            tokenizer=tokenizer,
-            decode_options=decode_options,
-        )
+        punctuated_text = punctuator.punctuate(audio=mel, text=tokens)
         punctuated_records.append(Record(record.audio_path, punctuated_text))
 
         if args.verbose:
