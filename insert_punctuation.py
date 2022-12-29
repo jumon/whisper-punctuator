@@ -86,8 +86,8 @@ def get_parser() -> argparse.ArgumentParser:
         "--truecasing",
         action="store_true",
         help=(
-            "[Experimental] Truecase the output text. The current implementation is very slow and "
-            "does not work well in practice. We will improve the implementation in the future."
+            "Truecase the output text. The current implementation is very slow. We plan to improve "
+            "the implementation in the future."
         ),
     )
     parser.add_argument(

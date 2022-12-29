@@ -21,7 +21,7 @@ class DecodeOptions:
     min_punctuation_probability: float = 0.0
     min_token_probability: float = 0.0
     beam_size: int = 1
-    truecasing: bool = False  # Experimental
+    truecasing: bool = False
     truecase_first_character: bool = True
     truecase_after_period: bool = True
     periods: str = ".?!。"
@@ -92,9 +92,8 @@ class AudioDataset(Dataset):
 
 
 def get_dataloader(
-    json: str, tokenizer: Tokenizer, batch_size: int = 1, fp16: bool = True
+    records: List[Record], tokenizer: Tokenizer, batch_size: int = 1, fp16: bool = True
 ) -> DataLoader:
-    records = read_json(json)
     dataset = AudioDataset(records, tokenizer, fp16)
     return DataLoader(
         dataset,
