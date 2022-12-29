@@ -1,5 +1,6 @@
 import argparse
 
+import torch
 import whisper
 from tqdm import tqdm
 from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE, get_tokenizer
@@ -66,7 +67,11 @@ def get_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--unicode-normalize", action="store_true", help="Normalize unicode")
-    parser.add_argument("--device", default="cuda", help="Device to use for inference")
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to use for inference",
+    )
     parser.add_argument(
         "--model",
         default="large",
@@ -127,7 +132,7 @@ def main():
     decode_options = construct_decode_options(tokenizer, model, args)
 
     # We currently only support batch size 1
-    data_loader = get_dataloader(args.json, tokenizer, batch_size=1, fp16=args.model == "cuda")
+    data_loader = get_dataloader(records, tokenizer, batch_size=1, fp16=args.device == "cuda")
 
     punctuated_records = []
     for record, (mel, tokens) in tqdm(zip(records, data_loader), total=len(records)):
