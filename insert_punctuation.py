@@ -67,7 +67,11 @@ def get_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--unicode-normalize", action="store_true", help="Normalize unicode")
-    parser.add_argument("--device", default="cuda", help="Device to use for inference")
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to use for inference",
+    )
     parser.add_argument(
         "--model",
         default="large",
@@ -196,9 +200,8 @@ class AudioDataset(Dataset):
 
 
 def get_dataloader(
-    json: str, tokenizer: Tokenizer, batch_size: int = 1, fp16: bool = True
+    records: List[Record], tokenizer: Tokenizer, batch_size: int = 1, fp16: bool = True
 ) -> DataLoader:
-    records = read_json(json)
     dataset = AudioDataset(records, tokenizer, fp16)
     return DataLoader(
         dataset,
@@ -438,7 +441,7 @@ def main():
     decode_options = construct_decode_options(tokenizer, model, args)
 
     # We currently only support batch size 1
-    data_loader = get_dataloader(args.json, tokenizer, batch_size=1, fp16=args.model == "cuda")
+    data_loader = get_dataloader(records, tokenizer, batch_size=1, fp16=args.device == "cuda")
 
     punctuated_records = []
     for record, (mel, tokens) in tqdm(zip(records, data_loader), total=len(records)):
