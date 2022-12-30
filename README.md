@@ -1,39 +1,52 @@
 # whisper-punctuator
-Zero-shot punctuation insertion using the [Whisper](https://github.com/openai/whisper) speech recognition model:
-* No additional training required
-* Works on ANY language that Whispers supports
-* Can change the style of punctuation by using a prompt
 
-Have you ever wanted to fine-tune a Whisper model using public data, but the data doesn't have punctuation? If so, this script is for you! It allows you to insert punctuation into unpunctuated text using the Whisper model in a zero-shot fashion, using a pair of unpunctuated text and audio files.
+Zero-shot punctuation insertion and truecasing using the [Whisper](https://github.com/openai/whisper) speech recognition model:
 
-## Quick Start
-To use the script, first install [Whisper](https://github.com/openai/whisper) and its dependencies. See the instructions [here](https://github.com/openai/whisper#setup) for more details.
+- No additional training required
+- Works on ANY language supported by Whisper
+- Can change the style of punctuation by using a prompt
 
-Run the following command to insert punctuation into text using a text and audio file pair as input:
+Have you ever wanted to fine-tune a Whisper model using public data, but the data doesn't have punctuation? If so, this repository is for you! It allows you to insert punctuation into unpunctuated text using the Whisper model in a zero-shot fashion using a pair of unpunctuated text and audio files, and it also supports truecasing.
+
+## Setup
+
+Run the following commands to install:
+
 ```
-python insert_punctuation.py --audio <path-to-audio-file> --text <text-to-be-punctuated>
+git clone https://github.com/jumon/whisper-punctuator.git
+cd whisper-punctuator
+pip install -e .
 ```
+
+If you see an error message like `ERROR: Directory '.' is not installable. Neither 'setup.py' nor 'pyproject.toml' found.`, you need to update pip to the latest version:
+
+```
+pip install --upgrade pip
+```
+
+You may also need to install [ffmpeg](https://ffmpeg.org/) and [rust](https://www.rust-lang.org/) depending on your environment. See the [instructions](https://github.com/openai/whisper#setup) in the Whisper repository for more details if you encounter any errors.
+
+## Usage
+
+To insert punctuation into text using a pair of text and an audio file as input, you can use the following code (the example audio and text are taken from the TEDLIUM2 corpus (https://www.openslr.org/19/, CC BY-NC-ND 3.0):
+
+```python
+from whisper_punctuator import Punctuator
+
+punctuator = Punctuator(language="en", punctuations=",.?", initial_prompt="Hello, everyone.")
+punctuated_text = punctuator.punctuate(
+    "tests/test.wav",
+    "and do you know what the answer to this question now is the answer is no it is not possible to buy a cell phone that doesn't do too much so"
+)
+print(punctuated_text) # -> "And do you know what the answer to this question now is? The answer is, no. It is not possible to buy a cell phone that doesn't do too much. So"
+```
+
 Note that the audio needs to be shorter than 30 seconds; if it is longer, the first 30 seconds will be used.
 
-The default setting treats `,` `.` `?` as punctuation. To change the punctuation characters, use the `--punctuations` flag and specify a list of characters. For example, to treat `,` `.` `?` `!` as punctuation, run:
-```
-python insert_punctuation.py --audio <path-to-audio-file> --text <text-to-be-punctuated> --punctuations ",.?!"
-```
-To handle languages other than English, you can use the `--language` flag to specify the language. For example, to insert punctuation for a Japanese text and treat `。` `、` as punctuation, run:
-```
-python insert_punctuation.py --audio <path-to-audio-file> --text <text-to-be-punctuated> --language ja --punctuations "。、"
-```
-To change the style of punctuation, use the `--initial-prompt` flag to specify a prompt. This will make the model more likely insert punctuation in the style of the prompt. For example, to insert punctuation after every word (though this is not recommended), run:
-```
-python insert_punctuation.py --audio <path-to-audio-file> --text <text-to-be-punctuated> --initial-prompt "hello, how, are, you, today?"
-```
-
-For all available options, run:
-```
-python insert_punctuation.py --help
-```
+For a command line example and more options, see the [examples](examples) directory.
 
 ## How does it work?
+
 Whisper is an automatic speech recognition (ASR) model trained on a massive amount of labeled audio data collected from the internet.
 The data used in its training contains punctuation, so the model learns to recognize punctuation as well.
 This allows Whisper to insert punctuation into a text given an audio and text pair.
@@ -43,6 +56,7 @@ The model calculates the probability of each token being generated with and with
 It then uses beam search to select the final prediction based on the average log probabilities of the generated tokens.
 
 ## Limitations
+
 - The results are dependent on the dataset used to train Whisper, which is not publicly available. Punctuation marks that are rare in the training data may not be recognized well.
 - Since the Whisper decoder generates tokens in a left-to-right fashion, it cannot see all future tokens when predicting the punctuation before the current token, which may lead to incorrect punctuation insertion. Using beam search with a large beam-size should mitigate this issue.
 - If the model fails to insert punctuation correctly, it may keep doing similar mistakes due to the autoregressive decoding. Using beam search or a prompt can mitigate the problem.
