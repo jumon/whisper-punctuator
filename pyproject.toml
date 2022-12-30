@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "whisepr-punctuator"
+version = "0.0.1"
+authors = [
+  { name="Jumon Nozaki", email="nozaki@sap.ist.i.kyoto-u.ac.jp" },
+]
+description = "Zero-shot Punctuation Insertion and Truecasing using Whisper"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "whisper @ git+https://github.com/openai/whisper.git"
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "flake8",
+    "isort",
+    "pytest",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/jumon/whisper-punctuator"
+"Bug Tracker" = "https://github.com/jumon/whisper-punctuator/issues"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build]
+include = [
+    "*.py",
+]
+exclude = [
+    "tests",
+]
+
+[tool.black]
+line-length = 100
+
+[tool.isort]
+known_first_party = ["whisper_punctuator"]
+profile = "black"
+line_length = 100
