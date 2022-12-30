@@ -124,17 +124,29 @@ class Punctuator:
 
         return torch.tensor(same_spelling_tokens, device=self.device)
 
-    def post_truecasing(self, text: str) -> str:
-        if self.decode_options.truecase_first_character:
+    def post_truecasing(
+        self,
+        text: str,
+        truecase_first_character: Optional[bool] = None,
+        truecase_after_period: Optional[bool] = None,
+        periods: Optional[str] = None,
+    ) -> str:
+        if truecase_first_character is None:
+            truecase_first_character = self.decode_options.truecase_first_character
+        if truecase_after_period is None:
+            truecase_after_period = self.decode_options.truecase_after_period
+        if periods is None:
+            periods = self.decode_options.periods
+
+        if truecase_first_character:
             text = text[0].upper() + text[1:]
 
-        if self.decode_options.truecase_after_period:
+        if truecase_after_period:
             text = re.sub(
-                f"([{self.decode_options.periods}] )([a-z])",
+                f"([{periods}] )([a-z])",
                 lambda m: m.group(1) + m.group(2).upper(),
                 text,
             )
-
         return text
 
     def _load_mel(self, audio_path: str) -> torch.Tensor:
@@ -142,7 +154,7 @@ class Punctuator:
         mel = pad_or_trim(mel, N_FRAMES)
         if self.fp16:
             mel = mel.half()
-        return mel
+        return mel.unsqueeze(0).to(self.device)
 
     def _encode_text(self, text: str) -> torch.Tensor:
         if self.tokenizer.language in ["ja", "zh"]:
