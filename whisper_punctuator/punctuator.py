@@ -138,7 +138,7 @@ class Punctuator:
         if periods is None:
             periods = self.decode_options.periods
 
-        if truecase_first_character:
+        if truecase_first_character and len(text) >= 1:
             text = text[0].upper() + text[1:]
 
         if truecase_after_period:
