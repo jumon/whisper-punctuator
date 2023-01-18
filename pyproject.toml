@@ -17,7 +17,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "whisper @ git+https://github.com/openai/whisper.git"
+    "openai-whisper"
 ]
 
 [project.optional-dependencies]
@@ -31,9 +31,6 @@ dev = [
 [project.urls]
 "Homepage" = "https://github.com/jumon/whisper-punctuator"
 "Bug Tracker" = "https://github.com/jumon/whisper-punctuator/issues"
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.build]
 include = [
