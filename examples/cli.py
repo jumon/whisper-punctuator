@@ -97,6 +97,20 @@ def get_parser() -> argparse.ArgumentParser:
         default=".?!。",
         help="Period characters for truecasing by the --truecase-after-period option",
     )
+    parser.add_argument(
+        "--allow-punctuation-within-word",
+        action="store_true",
+        help=(
+            "Allow punctuation insertion within a word. If False, punctuation will only be "
+            "inserted at the end of a word."
+        ),
+    )
+    parser.add_argument(
+        "--no-allow-punctuation-within-word",
+        action="store_false",
+        dest="allow-punctuation-within-word",
+    )
+    parser.set_defaults(allow_punctuation_within_word=False)
     return parser
 
 
@@ -185,6 +199,7 @@ def main():
         truecase_first_character=args.truecase_first_character,
         truecase_after_period=args.truecase_after_period,
         periods=args.periods,
+        allow_punctuation_within_word=args.allow_punctuation_within_word,
     )
 
     # We currently only support batch size 1

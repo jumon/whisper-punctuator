@@ -2,6 +2,7 @@ import re
 import string
 from dataclasses import dataclass
 from functools import lru_cache
+from logging import getLogger
 from typing import List, Optional, Union
 
 import torch
@@ -9,17 +10,21 @@ import whisper
 from whisper.audio import N_FRAMES, log_mel_spectrogram, pad_or_trim
 from whisper.tokenizer import get_tokenizer
 
+logger = getLogger(__name__)
+
 
 @dataclass
 class DecodeOptions:
     initial_tokens: torch.Tensor
     punctuation_tokens: torch.Tensor
-    no_punctuation_before: List[str]
+    no_punctuation_before: List[str]  # do not insert punctuation before these patterns
     beam_size: int = 1
     truecase_search: bool = False
     truecase_first_character: bool = True
     truecase_after_period: bool = True
     periods: str = ".?!。"
+    # whether to allow punctuation insertion other than before spaces
+    allow_punctuation_within_word: bool = False
 
 
 class BeamNode:
@@ -64,7 +69,10 @@ class Punctuator:
         truecase_first_character: bool = True,
         truecase_after_period: bool = True,
         periods: str = ".?!。",
+        allow_punctuation_within_word: Optional[bool] = None,
     ):
+        self.NOSPACE_LANGUAGES = ["zh", "ja", "th", "lo", "my"]
+
         self.device = self._get_device(device)
         self.fp16 = self.device == "cuda"
         self.language = language
@@ -80,6 +88,10 @@ class Punctuator:
         except ValueError:
             raise ValueError("Each character in `punctuations` must be a single token")
 
+        self.allow_punctuation_within_word = self._get_allow_punctuation_within_word(
+            allow_punctuation_within_word
+        )
+
         self.options = DecodeOptions(
             initial_tokens=self._get_initial_tokens(initial_prompt),
             punctuation_tokens=punctuation_tokens,
@@ -89,6 +101,7 @@ class Punctuator:
             truecase_first_character=truecase_first_character,
             truecase_after_period=truecase_after_period,
             periods=periods,
+            allow_punctuation_within_word=self.allow_punctuation_within_word,
         )
 
     def _get_device(self, device: Optional[str]) -> str:
@@ -122,13 +135,27 @@ class Punctuator:
         For languages that do not use spaces, namely Chinese, Japanese, Thai, Lao, and
         Burmese, return the text as is.
         """
-        if self.language in ["zh", "ja", "th", "lo", "my"]:
+        if self.language in self.NOSPACE_LANGUAGES:
             return text.strip()
         else:
             return " " + text.strip()
 
     def _get_no_punctuation_before(self, punctuation_suppressing_chars: str) -> List[str]:
         return [self._byte_encode(char) for char in punctuation_suppressing_chars]
+
+    def _get_allow_punctuation_within_word(
+        self, allow_punctuation_within_word: Optional[bool]
+    ) -> bool:
+        if not allow_punctuation_within_word and self.language in self.NOSPACE_LANGUAGES:
+            logger.warning(
+                f"`allow_punctuation_within_word` is set False, but the language {self.language}"
+                "does not use spaces to separate words, which results in no punctuation insertion."
+            )
+
+        if allow_punctuation_within_word is None:
+            allow_punctuation_within_word = self.language in self.NOSPACE_LANGUAGES
+
+        return allow_punctuation_within_word
 
     def _load_mel(self, audio_path: str) -> torch.Tensor:
         mel = log_mel_spectrogram(audio_path)
@@ -145,6 +172,12 @@ class Punctuator:
         # do not insert punctuation in a row
         if len(beam.tokens) > 0 and beam.tokens[-1] in self.options.punctuation_tokens:
             return True
+
+        # do not insert punctuation within a word
+        if not self.options.allow_punctuation_within_word:
+            # Ġ corresponds to a space in the GP2TokenizerFast's representation
+            if beam.pos < len(byte_encoded_text) and byte_encoded_text[beam.pos] != "Ġ":
+                return True
 
         # do not insert punctuation before a character that suppresses it
         for pattern in self.options.no_punctuation_before:
