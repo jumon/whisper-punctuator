@@ -165,3 +165,4 @@ data/
 output/
 .vscode/
 .DS_Store
+debug/

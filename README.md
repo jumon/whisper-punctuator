@@ -38,7 +38,7 @@ punctuated_text = punctuator.punctuate(
     "tests/test.wav",
     "and do you know what the answer to this question now is the answer is no it is not possible to buy a cell phone that doesn't do too much so"
 )
-print(punctuated_text) # -> "And do you know what the answer to this question now is? The answer is, no. It is not possible to buy a cell phone that doesn't do too much. So"
+print(punctuated_text) # -> "And do you know what the answer to this question now is? The answer is no. It is not possible to buy a cell phone that doesn't do too much. So"
 ```
 
 Note that the audio needs to be shorter than 30 seconds; if it is longer, the first 30 seconds will be used.
@@ -50,10 +50,9 @@ For a command line example and more options, see the [examples](examples) direct
 Whisper is an automatic speech recognition (ASR) model trained on a massive amount of labeled audio data collected from the internet.
 The data used in its training contains punctuation, so the model learns to recognize punctuation as well.
 This allows Whisper to insert punctuation into a text given an audio and text pair.
-To insert punctuation, the audio is first input into the encoder of the model to generate the encoder hidden states.
-Then, the decoder of the model processes each token in the text one by one, in an autoregressive fashion, along with the encoder hidden states.
-The model calculates the probability of each token being generated with and without being preceded by each punctuation character.
-It then uses beam search to select the final prediction based on the average log probabilities of the generated tokens.
+To insert punctuation, Whisper first processes the audio through its encoder, generating encoder hidden states.
+Given the generated hidden states, the decoder generates tokens, restricting the output to the input text with the addition of punctuation marks.
+The final prediction is determined using beam search, based on the average log probabilities of the generated tokens.
 
 ## Limitations
 
@@ -62,5 +61,3 @@ It then uses beam search to select the final prediction based on the average log
 - If the model fails to insert punctuation correctly, it may keep doing similar mistakes due to the autoregressive decoding. Using beam search or a prompt can mitigate the problem.
 - The `--beam-size` and `--initial-prompt` flags may need to be fine-tuned to get the best results, depending on the data.
 - The current implementation does not allow for punctuation marks that consist of multiple tokens according to the Whisper tokenizer.
-- If you want to fine-tune a Whisper model using publicly available data, you may want to ensure that the data is not only punctuated but also truecased. The current implementation truecases the first letter of each sentence (the first letter before periods specified by the `--periods` flag) by default. It also supports searching for the best truecasing by using the `--truecase-search` flag, but this feature is currently very slow and we plan to improve it in the future.
-- This script cannot insert punctuation "inside" a token. This would be a problem for languages that do not use spaces between words such as Japanese and Chinese. For example, the Japanese text `えールール` (which means "uh, a rule", where "えー" means "uh" and "ルール" means "rule") is tokenized into `え` `ール` `ール` by the Whisper tokenizer, thus the script cannot insert punctuation between `ー` and `ル` to get the correct punctuated text `えー、ルール`. This is a limitation of tokenizers in general, and it is not clear how to solve this problem.

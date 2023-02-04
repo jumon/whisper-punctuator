@@ -19,12 +19,11 @@ def audio(punctuator: Punctuator):
 
 
 @pytest.fixture
-def text(punctuator: Punctuator):
-    original_text = (
+def text():
+    return (
         "and do you know what the answer to this question now is the answer is no it "
         "is not possible to buy a cell phone that doesn't do too much so"
     )
-    return punctuator._encode_text(original_text)
 
 
 # The "tiny" model is used for testing purposes and results are not very accurate
@@ -41,16 +40,16 @@ def text(punctuator: Punctuator):
             "",
             False,
             (
-                "and do you know what the answer to this question now is? the answer is no, it is "
-                "not possible to buy a cell phone that doesn't do too much, so"
+                "and do you know what the answer to this question now is? the answer is no. it is "
+                "not possible to buy a cell phone that doesn't do too much. so"
             ),
         ),
         (
-            ",",
+            ",?",
             "",
             False,
             (
-                "and do you know what the answer to this question now is, the answer is no, it is "
+                "and do you know what the answer to this question now is? the answer is no, it is "
                 "not possible to buy a cell phone that doesn't do too much, so"
             ),
         ),
@@ -68,7 +67,7 @@ def text(punctuator: Punctuator):
             "Hello, everyone.",
             True,
             (
-                "And do you know what the answer to this question now is? the answer is no. It is "
+                "And do you know what the answer to this question now is? The answer is no. It is "
                 "not possible to buy a cell phone that doesn't do too much. So."
             ),
         ),

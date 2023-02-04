@@ -9,7 +9,7 @@ import whisper
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from whisper.audio import N_FRAMES, log_mel_spectrogram, pad_or_trim
-from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE, Tokenizer
+from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
 
 from whisper_punctuator import Punctuator
 
@@ -33,30 +33,10 @@ def get_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--beam-size", type=int, default=1, help="Beam size for beam search")
     parser.add_argument(
-        "--min-punctuation-probability",
-        type=float,
-        default=0.0,
-        help=(
-            "Minimum probability for a punctuation to be a candidate."
-            "Increasing this value will speed up the process, but may result in less punctuation "
-            "being inserted."
-        ),
-    )
-    parser.add_argument(
-        "--min-token-probability",
-        type=float,
-        default=0.0,
-        help=(
-            "Minimum probability for a token with the same spelling, when lowercased, to be a "
-            "candidate. Increasing this value will speed up the process, but may cause incorrect "
-            "capitalization."
-        ),
-    )
-    parser.add_argument(
         "--initial-prompt", type=str, default="", help="Optional text to provide as a prompt"
     )
     parser.add_argument(
-        "--punctuation-suppressing-chars",
+        "--no-punctuation-before",
         type=str,
         default="",
         help=(
@@ -127,9 +107,8 @@ class Record:
 
 
 class AudioDataset(Dataset):
-    def __init__(self, records: List[Record], tokenizer: Tokenizer, fp16: bool = True) -> None:
+    def __init__(self, records: List[Record], fp16: bool = True) -> None:
         self.records = records
-        self.tokenizer = tokenizer
         self.fp16 = fp16
 
     def __len__(self) -> int:
@@ -141,21 +120,11 @@ class AudioDataset(Dataset):
         mel = pad_or_trim(mel, N_FRAMES)
         if self.fp16:
             mel = mel.half()
-
-        if self.tokenizer.language in ["ja", "zh"]:
-            text = record.text.strip()
-        else:
-            text = " " + record.text.strip()
-        tokens = self.tokenizer.encode(text)
-        tokens = torch.tensor(tokens + [self.tokenizer.eot], dtype=torch.long)
-
-        return mel, tokens
+        return mel
 
 
-def get_dataloader(
-    records: List[Record], tokenizer: Tokenizer, batch_size: int = 1, fp16: bool = True
-) -> DataLoader:
-    dataset = AudioDataset(records, tokenizer, fp16)
+def get_dataloader(records: List[Record], batch_size: int = 1, fp16: bool = True) -> DataLoader:
+    dataset = AudioDataset(records, fp16)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -209,10 +178,8 @@ def main():
         language=args.language,
         device=args.device,
         punctuations=args.punctuations,
-        punctuation_suppressing_chars=args.punctuation_suppressing_chars,
+        no_punctuation_before=args.no_punctuation_before,
         initial_prompt=args.initial_prompt,
-        min_punctuation_probability=args.min_punctuation_probability,
-        min_token_probability=args.min_token_probability,
         beam_size=args.beam_size,
         truecase_search=args.truecase_search,
         truecase_first_character=args.truecase_first_character,
@@ -221,14 +188,12 @@ def main():
     )
 
     # We currently only support batch size 1
-    data_loader = get_dataloader(
-        records, punctuator.tokenizer, batch_size=1, fp16=args.device == "cuda"
-    )
+    data_loader = get_dataloader(records, batch_size=1, fp16=args.device == "cuda")
 
     punctuated_records = []
-    for record, (mel, tokens) in tqdm(zip(records, data_loader), total=len(records)):
-        mel, tokens = mel.to(args.device), tokens[0].to(args.device)
-        punctuated_text = punctuator.punctuate(audio=mel, text=tokens)
+    for record, mel in tqdm(zip(records, data_loader), total=len(records)):
+        mel = mel.to(args.device)
+        punctuated_text = punctuator.punctuate(audio=mel, text=record.text)
         punctuated_records.append(Record(record.audio_path, punctuated_text))
 
         if args.verbose:
